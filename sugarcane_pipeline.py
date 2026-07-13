@@ -34,6 +34,52 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # ==========================================
+# FIGURE OUTPUT CONFIG
+# ==========================================
+FIGURES_DIR = Path("outputs") / "figures"
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+SHOW_FIGURES = os.environ.get("SHOW_FIGURES", "0") == "1"
+RUN_EXPLAINABILITY = os.environ.get("RUN_EXPLAINABILITY", "1") == "1"
+FORCE_RETRAIN = os.environ.get("FORCE_RETRAIN", "0") == "1"
+PRINT_MODEL_SUMMARY_TERMINAL = os.environ.get("PRINT_MODEL_SUMMARY_TERMINAL", "0") == "1"
+FIGURE_DPI = int(os.environ.get("FIGURE_DPI", "600"))
+FIGURE_FORMATS = tuple(
+    fmt.strip().lower() for fmt in os.environ.get("FIGURE_FORMATS", "png,pdf").split(",") if fmt.strip()
+)
+EXPORTED_FIGURES = []
+
+plt.rcParams.update({
+    "figure.dpi": 120,
+    "savefig.dpi": FIGURE_DPI,
+    "font.size": 12,
+    "axes.titlesize": 13,
+    "axes.labelsize": 12,
+    "legend.fontsize": 10,
+})
+
+print(f"Figure output directory: {FIGURES_DIR.resolve()}")
+print(
+    "SHOW_FIGURES="
+    f"{SHOW_FIGURES} | RUN_EXPLAINABILITY={RUN_EXPLAINABILITY} | "
+    f"FORCE_RETRAIN={FORCE_RETRAIN} | PRINT_MODEL_SUMMARY_TERMINAL={PRINT_MODEL_SUMMARY_TERMINAL} | "
+    f"FIGURE_DPI={FIGURE_DPI} | FIGURE_FORMATS={FIGURE_FORMATS}"
+)
+
+def finalize_plot(filename=None):
+    """Save current figure in all requested formats and optionally show it."""
+    if filename:
+        base_name = Path(filename).stem
+        for fmt in FIGURE_FORMATS:
+            out_path = FIGURES_DIR / f"{base_name}.{fmt}"
+            plt.savefig(out_path, dpi=FIGURE_DPI, bbox_inches="tight")
+            EXPORTED_FIGURES.append(out_path)
+            print(f"Saved figure: {out_path.resolve()}")
+    if SHOW_FIGURES:
+        plt.show()
+    else:
+        plt.close()
+
+# ==========================================
 # 1. DOWNLOAD AND PREPARE DATASET
 # ==========================================
 print("Downloading dataset via Kagglehub...")
@@ -209,7 +255,7 @@ def transformer_encoder(inputs, num_heads=4, key_dim=64, ff_dim=256, dropout_rat
     return Add()([x3, x2])
 
 
-def vit_branch(inputs, patch_size=16, projection_dim=64, transformer_layers=6, num_heads=4, dropout_rate=0.1):
+def vit_branch(inputs, patch_size=16, projection_dim=64, transformer_layers=6, num_heads=4, dropout_rate=0.1, return_tokens=False):
     num_patches = (IMG_SIZE // patch_size) ** 2
     patches = Patches(patch_size)(inputs)
     encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
@@ -226,9 +272,44 @@ def vit_branch(inputs, patch_size=16, projection_dim=64, transformer_layers=6, n
         x = SEBlock(channels=projection_dim, ratio=8)(x)
 
     x = LayerNormalization(epsilon=1e-6)(x)
+    if return_tokens:
+        return x
+
     x = GlobalAveragePooling1D()(x)
     x = Dropout(0.5)(x)
     return x
+
+
+def cross_attention_fusion(cnn_feature_map, vit_tokens, projection_dim=64, num_heads=4, dropout_rate=0.1):
+    """Bidirectional cross-attention fusion between CNN and ViT token streams."""
+    cnn_tokens = tf.keras.layers.Reshape((-1, cnn_feature_map.shape[-1]))(cnn_feature_map)
+    cnn_tokens = Dense(projection_dim)(cnn_tokens)
+    vit_tokens = Dense(projection_dim)(vit_tokens)
+
+    # ViT queries CNN context
+    vit_from_cnn = MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=projection_dim,
+        dropout=dropout_rate,
+    )(query=vit_tokens, key=cnn_tokens, value=cnn_tokens)
+    vit_fused = Add()([vit_tokens, vit_from_cnn])
+    vit_fused = LayerNormalization(epsilon=1e-6)(vit_fused)
+
+    # CNN queries ViT context
+    cnn_from_vit = MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=projection_dim,
+        dropout=dropout_rate,
+    )(query=cnn_tokens, key=vit_tokens, value=vit_tokens)
+    cnn_fused = Add()([cnn_tokens, cnn_from_vit])
+    cnn_fused = LayerNormalization(epsilon=1e-6)(cnn_fused)
+
+    vit_pooled = GlobalAveragePooling1D()(vit_fused)
+    cnn_pooled = GlobalAveragePooling1D()(cnn_fused)
+
+    fused = Concatenate()([cnn_pooled, vit_pooled])
+    fused = Dropout(dropout_rate)(fused)
+    return fused
 
 
 def build_hybrid_model(dense_units, dropout_rate, learning_rate, optimizer_name, num_classes):
@@ -238,18 +319,23 @@ def build_hybrid_model(dense_units, dropout_rate, learning_rate, optimizer_name,
     backbone.trainable = False
 
     cnn_feature_map = backbone.output
-    cnn_branch = GlobalAveragePooling2D()(cnn_feature_map)
-
-    vit_branch_features = vit_branch(
+    vit_tokens = vit_branch(
         inputs,
         patch_size=16,
         projection_dim=64,
         transformer_layers=6,
         num_heads=4,
         dropout_rate=dropout_rate,
+        return_tokens=True,
     )
 
-    combined = Concatenate()([cnn_branch, vit_branch_features])
+    combined = cross_attention_fusion(
+        cnn_feature_map,
+        vit_tokens,
+        projection_dim=64,
+        num_heads=4,
+        dropout_rate=dropout_rate,
+    )
     combined = Dense(dense_units, activation='relu')(combined)
     combined = Dropout(dropout_rate)(combined)
     outputs = Dense(num_classes, activation='softmax')(combined)
@@ -262,105 +348,139 @@ def build_hybrid_model(dense_units, dropout_rate, learning_rate, optimizer_name,
 # ==========================================
 # 3. OPTUNA HYPERPARAMETER TUNING
 # ==========================================
-def objective(trial):
+FINAL_MODEL_PATH = Path("Sugarcane_Hybrid_Final.keras")
+BEST_WEIGHTS_PATH = Path("best_efficientnet_b4.keras")
+
+if FINAL_MODEL_PATH.exists() and not FORCE_RETRAIN:
+    print(f"\nFound existing trained model: {FINAL_MODEL_PATH.resolve()}")
+    print("Skipping Optuna/training. Set FORCE_RETRAIN=1 to train again.")
+    model = tf.keras.models.load_model(
+        FINAL_MODEL_PATH,
+        custom_objects={
+            "Patches": Patches,
+            "PatchEncoder": PatchEncoder,
+            "SEBlock": SEBlock,
+        },
+        compile=False,
+    )
+    model.compile(optimizer=Adam(learning_rate=1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+    try:
+        base_model = model.get_layer("efficientnetb4")
+    except ValueError:
+        base_model = None
+        print("Warning: EfficientNet backbone layer not found by name in loaded model.")
+
+    # Keep plotting/evaluation pipeline compatible when training is skipped
+    history = type("HistoryObj", (), {"history": {"accuracy": [], "val_accuracy": [], "loss": [], "val_loss": []}})()
+    history_finetune = type("HistoryObj", (), {"history": {"accuracy": [], "val_accuracy": [], "loss": [], "val_loss": []}})()
+    lr_schedule = []
+    TRAINING_RAN = False
+else:
+    def objective(trial):
+        tf.keras.backend.clear_session()
+
+        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+        dropout_rate = trial.suggest_float("dropout_rate", 0.2, 0.6)
+        optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "RMSprop"])
+        dense_units = trial.suggest_categorical("dense_units", [128, 256, 512])
+
+        model, _ = build_hybrid_model(
+            dense_units=dense_units,
+            dropout_rate=dropout_rate,
+            learning_rate=learning_rate,
+            optimizer_name=optimizer_name,
+            num_classes=len(class_names),
+        )
+
+        history = model.fit(train_generator, validation_data=val_generator, epochs=5, class_weight=weight_dict, verbose=1)
+        return max(history.history["val_accuracy"])
+
+    print("\nStarting Optuna Study...")
+    study = optuna.create_study(
+        study_name="sugarcane_efficientnet_study",
+        storage="sqlite:///sugarcane_optuna_study.db",  # Saves locally in your VS Code folder
+        load_if_exists=True,
+        direction="maximize",
+        pruner=optuna.pruners.MedianPruner()
+    )
+    TARGET_TOTAL_TRIALS = 25
+    finished_states = {
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.PRUNED,
+        optuna.trial.TrialState.FAIL,
+    }
+    completed_trials = sum(1 for t in study.trials if t.state in finished_states)
+    remaining_trials = max(0, TARGET_TOTAL_TRIALS - completed_trials)
+
+    print(f"Existing trials in DB: {completed_trials}")
+    print(f"Remaining trials to run: {remaining_trials}")
+
+    if remaining_trials > 0:
+        study.optimize(objective, n_trials=remaining_trials, show_progress_bar=True)
+    else:
+        print(f"Target already reached ({TARGET_TOTAL_TRIALS} trials). Skipping optimization.")
+    print("Best Params:", study.best_params)
+
+    # ==========================================
+    # 4. BUILD & TRAIN THE BEST MODEL
+    # ==========================================
     tf.keras.backend.clear_session()
-
-    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
-    dropout_rate = trial.suggest_float("dropout_rate", 0.2, 0.6)
-    optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "RMSprop"])
-    dense_units = trial.suggest_categorical("dense_units", [128, 256, 512])
-
-    model, _ = build_hybrid_model(
-        dense_units=dense_units,
-        dropout_rate=dropout_rate,
-        learning_rate=learning_rate,
-        optimizer_name=optimizer_name,
+    best = study.best_params
+    model, base_model = build_hybrid_model(
+        dense_units=best["dense_units"],
+        dropout_rate=best["dropout_rate"],
+        learning_rate=best["learning_rate"],
+        optimizer_name=best["optimizer"],
         num_classes=len(class_names),
     )
 
-    history = model.fit(train_generator, validation_data=val_generator, epochs=5, class_weight=weight_dict, verbose=1)
-    return max(history.history["val_accuracy"])
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3),
+        ModelCheckpoint(str(BEST_WEIGHTS_PATH), save_best_only=True)
+    ]
 
-print("\nStarting Optuna Study...")
-study = optuna.create_study(
-    study_name="sugarcane_efficientnet_study",
-    storage="sqlite:///sugarcane_optuna_study.db", # Saves locally in your VS Code folder
-    load_if_exists=True,
-    direction="maximize",
-    pruner=optuna.pruners.MedianPruner()
-)
-TARGET_TOTAL_TRIALS = 25
-finished_states = {
-    optuna.trial.TrialState.COMPLETE,
-    optuna.trial.TrialState.PRUNED,
-    optuna.trial.TrialState.FAIL,
-}
-completed_trials = sum(1 for t in study.trials if t.state in finished_states)
-remaining_trials = max(0, TARGET_TOTAL_TRIALS - completed_trials)
+    # Learning rate tracking callback
+    lr_schedule = []
 
-print(f"Existing trials in DB: {completed_trials}")
-print(f"Remaining trials to run: {remaining_trials}")
+    class LRLogger(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            lr = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+            lr_schedule.append(lr)
 
-if remaining_trials > 0:
-    study.optimize(objective, n_trials=remaining_trials, show_progress_bar=True)
-else:
-    print(f"Target already reached ({TARGET_TOTAL_TRIALS} trials). Skipping optimization.")
-print("Best Params:", study.best_params)
+    callbacks.append(LRLogger())
 
-# ==========================================
-# 4. BUILD & TRAIN THE BEST MODEL
-# ==========================================
-tf.keras.backend.clear_session()
-best = study.best_params
-model, base_model = build_hybrid_model(
-    dense_units=best["dense_units"],
-    dropout_rate=best["dropout_rate"],
-    learning_rate=best["learning_rate"],
-    optimizer_name=best["optimizer"],
-    num_classes=len(class_names),
-)
+    print("\nTraining best model for 20 epochs...")
+    history = model.fit(
+        train_generator, validation_data=val_generator, epochs=20,
+        class_weight=weight_dict, callbacks=callbacks
+    )
 
-callbacks = [
-    EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-    ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3),
-    ModelCheckpoint('best_efficientnet_b4.keras', save_best_only=True)
-]
+    # ==========================================
+    # 5. FINE-TUNING
+    # ==========================================
+    print("\nUnfreezing top layers for fine-tuning...")
+    for layer in base_model.layers[-50:]:
+        if not isinstance(layer, tf.keras.layers.BatchNormalization):
+            layer.trainable = True
 
-# Learning rate tracking callback
-lr_schedule = []
-class LRLogger(tf.keras.callbacks.Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        lr = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
-        lr_schedule.append(lr)
-
-callbacks.append(LRLogger())
-
-print("\nTraining best model for 20 epochs...")
-history = model.fit(
-    train_generator, validation_data=val_generator, epochs=20, 
-    class_weight=weight_dict, callbacks=callbacks
-)
-
-# ==========================================
-# 5. FINE-TUNING
-# ==========================================
-print("\nUnfreezing top layers for fine-tuning...")
-for layer in base_model.layers[-50:]:
-    if not isinstance(layer, tf.keras.layers.BatchNormalization):
-        layer.trainable = True
-
-model.compile(optimizer=Adam(learning_rate=1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
-history_finetune = model.fit(
-    train_generator, validation_data=val_generator, epochs=10, 
-    class_weight=weight_dict, callbacks=callbacks
-)
+    model.compile(optimizer=Adam(learning_rate=1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+    history_finetune = model.fit(
+        train_generator, validation_data=val_generator, epochs=10,
+        class_weight=weight_dict, callbacks=callbacks
+    )
+    TRAINING_RAN = True
 
 # ==========================================
 # 6. EVALUATION & VISUALIZATION
 # ==========================================
-model.load_weights('best_efficientnet_b4.keras')
-model.save('Sugarcane_Hybrid_Final.keras')
-print("Final model saved as: Sugarcane_Hybrid_Final.keras")
+if FORCE_RETRAIN or not FINAL_MODEL_PATH.exists():
+    if BEST_WEIGHTS_PATH.exists():
+        model.load_weights(str(BEST_WEIGHTS_PATH))
+    model.save(str(FINAL_MODEL_PATH))
+    print(f"Final model saved as: {FINAL_MODEL_PATH}")
+else:
+    print(f"Using existing saved model for evaluation: {FINAL_MODEL_PATH}")
 test_loss, test_acc = model.evaluate(test_generator)
 print(f"\nFinal Test Accuracy: {test_acc:.4f}")
 
@@ -371,6 +491,7 @@ true_class = test_generator.classes
 print("\nClassification Report:")
 report_dict = classification_report(true_class, pred_class, target_names=class_names, output_dict=True)
 print(classification_report(true_class, pred_class, target_names=class_names))
+print("\nGenerating and saving evaluation figures...")
 
 # Confusion Matrix
 cm = confusion_matrix(true_class, pred_class)
@@ -379,8 +500,7 @@ sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, ytic
 plt.xlabel('Predicted')
 plt.ylabel('True')
 plt.title('Confusion Matrix')
-plt.savefig("confusion_matrix.png", dpi=300, bbox_inches="tight")
-plt.show()
+finalize_plot("confusion_matrix.png")
 
 # ==========================================
 # 6.5 ADVANCED EVALUATION METRICS
@@ -400,8 +520,7 @@ plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
 plt.title('ROC-AUC Multi-class Curve')
 plt.legend(loc="lower right")
-plt.savefig("roc_auc_curve.png", dpi=300, bbox_inches="tight")
-plt.show()
+finalize_plot("roc_auc_curve.png")
 
 # Dynamic F1-Score Chart
 f1_scores = [report_dict[cls]['f1-score'] for cls in class_names]
@@ -410,69 +529,68 @@ plt.bar(class_names, f1_scores, color=['#4C72B0', '#55A868', '#C44E52'])
 plt.ylim(0.0, 1.05)
 plt.title('F1-Score per Class')
 plt.ylabel('F1-Score')
-plt.savefig("f1_scores.png", dpi=300, bbox_inches="tight")
-plt.show()
+finalize_plot("f1_scores.png")
 
 # ==========================================
 # 6.6 TRAINING CURVES & ADDITIONAL METRICS
 # ==========================================
+if TRAINING_RAN:
+    # Combine training histories
+    all_accuracy = history.history['accuracy'] + history_finetune.history['accuracy']
+    all_val_accuracy = history.history['val_accuracy'] + history_finetune.history['val_accuracy']
+    all_loss = history.history['loss'] + history_finetune.history['loss']
+    all_val_loss = history.history['val_loss'] + history_finetune.history['val_loss']
+    epochs_initial = len(history.history['accuracy'])
 
-# Combine training histories
-all_accuracy = history.history['accuracy'] + history_finetune.history['accuracy']
-all_val_accuracy = history.history['val_accuracy'] + history_finetune.history['val_accuracy']
-all_loss = history.history['loss'] + history_finetune.history['loss']
-all_val_loss = history.history['val_loss'] + history_finetune.history['val_loss']
-epochs_initial = len(history.history['accuracy'])
+    # Plot Training & Validation Loss/Accuracy (both stages)
+    plt.figure(figsize=(14, 5))
 
-# Plot Training & Validation Loss/Accuracy (both stages)
-plt.figure(figsize=(14, 5))
-
-# Accuracy
-plt.subplot(1, 2, 1)
-plt.plot(range(epochs_initial), history.history['accuracy'], label='Train Accuracy (Initial)', linewidth=2)
-plt.plot(range(epochs_initial), history.history['val_accuracy'], label='Val Accuracy (Initial)', linewidth=2)
-plt.plot(range(epochs_initial, epochs_initial + len(history_finetune.history['accuracy'])), 
-         history_finetune.history['accuracy'], label='Train Accuracy (Fine-tune)', linewidth=2, linestyle='--')
-plt.plot(range(epochs_initial, epochs_initial + len(history_finetune.history['val_accuracy'])), 
-         history_finetune.history['val_accuracy'], label='Val Accuracy (Fine-tune)', linewidth=2, linestyle='--')
-plt.axvline(x=epochs_initial, color='red', linestyle=':', alpha=0.5, label='Fine-tuning Start')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
-plt.title('Training vs Validation Accuracy (Initial + Fine-tune)')
-plt.legend(fontsize=9)
-plt.grid(True, alpha=0.3)
-
-# Loss
-plt.subplot(1, 2, 2)
-plt.plot(range(epochs_initial), history.history['loss'], label='Train Loss (Initial)', linewidth=2)
-plt.plot(range(epochs_initial), history.history['val_loss'], label='Val Loss (Initial)', linewidth=2)
-plt.plot(range(epochs_initial, epochs_initial + len(history_finetune.history['loss'])), 
-         history_finetune.history['loss'], label='Train Loss (Fine-tune)', linewidth=2, linestyle='--')
-plt.plot(range(epochs_initial, epochs_initial + len(history_finetune.history['val_loss'])), 
-         history_finetune.history['val_loss'], label='Val Loss (Fine-tune)', linewidth=2, linestyle='--')
-plt.axvline(x=epochs_initial, color='red', linestyle=':', alpha=0.5, label='Fine-tuning Start')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('Training vs Validation Loss (Initial + Fine-tune)')
-plt.legend(fontsize=9)
-plt.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig("training_curves.png", dpi=300, bbox_inches="tight")
-plt.show()
-
-# Plot Learning Rate Schedule
-if lr_schedule:
-    plt.figure(figsize=(10, 4))
-    plt.plot(lr_schedule, linewidth=2, marker='o', markersize=4)
+    # Accuracy
+    plt.subplot(1, 2, 1)
+    plt.plot(range(epochs_initial), history.history['accuracy'], label='Train Accuracy (Initial)', linewidth=2)
+    plt.plot(range(epochs_initial), history.history['val_accuracy'], label='Val Accuracy (Initial)', linewidth=2)
+    plt.plot(range(epochs_initial, epochs_initial + len(history_finetune.history['accuracy'])), 
+             history_finetune.history['accuracy'], label='Train Accuracy (Fine-tune)', linewidth=2, linestyle='--')
+    plt.plot(range(epochs_initial, epochs_initial + len(history_finetune.history['val_accuracy'])), 
+             history_finetune.history['val_accuracy'], label='Val Accuracy (Fine-tune)', linewidth=2, linestyle='--')
+    plt.axvline(x=epochs_initial, color='red', linestyle=':', alpha=0.5, label='Fine-tuning Start')
     plt.xlabel('Epoch')
-    plt.ylabel('Learning Rate')
-    plt.title('Learning Rate Schedule (ReduceLROnPlateau)')
-    plt.yscale('log')
+    plt.ylabel('Accuracy')
+    plt.title('Training vs Validation Accuracy (Initial + Fine-tune)')
+    plt.legend(fontsize=9)
     plt.grid(True, alpha=0.3)
-    plt.savefig("learning_rate_schedule.png", dpi=300, bbox_inches="tight")
-    plt.show()
-    print(f"Learning rate tracked over {len(lr_schedule)} epochs")
+
+    # Loss
+    plt.subplot(1, 2, 2)
+    plt.plot(range(epochs_initial), history.history['loss'], label='Train Loss (Initial)', linewidth=2)
+    plt.plot(range(epochs_initial), history.history['val_loss'], label='Val Loss (Initial)', linewidth=2)
+    plt.plot(range(epochs_initial, epochs_initial + len(history_finetune.history['loss'])), 
+             history_finetune.history['loss'], label='Train Loss (Fine-tune)', linewidth=2, linestyle='--')
+    plt.plot(range(epochs_initial, epochs_initial + len(history_finetune.history['val_loss'])), 
+             history_finetune.history['val_loss'], label='Val Loss (Fine-tune)', linewidth=2, linestyle='--')
+    plt.axvline(x=epochs_initial, color='red', linestyle=':', alpha=0.5, label='Fine-tuning Start')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training vs Validation Loss (Initial + Fine-tune)')
+    plt.legend(fontsize=9)
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    finalize_plot("training_curves.png")
+
+    # Plot Learning Rate Schedule
+    if lr_schedule:
+        plt.figure(figsize=(10, 4))
+        plt.plot(lr_schedule, linewidth=2, marker='o', markersize=4)
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.title('Learning Rate Schedule (ReduceLROnPlateau)')
+        plt.yscale('log')
+        plt.grid(True, alpha=0.3)
+        finalize_plot("learning_rate_schedule.png")
+        print(f"Learning rate tracked over {len(lr_schedule)} epochs")
+else:
+    print("Training curves skipped because existing trained model was loaded.")
 
 # ==========================================
 # 6.7 ADDITIONAL STATISTICAL METRICS
@@ -517,8 +635,7 @@ plt.title('Precision-Recall Curve')
 plt.legend(loc='best')
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.savefig("precision_recall_curves.png", dpi=300, bbox_inches="tight")
-plt.show()
+finalize_plot("precision_recall_curves.png")
 
 # ==========================================
 # 6.9 PER-CLASS METRICS TABLE
@@ -547,7 +664,10 @@ print(metrics_df.to_string(index=False))
 print("\n" + "="*60)
 print("MODEL ARCHITECTURE SUMMARY")
 print("="*60)
-model.summary()
+if PRINT_MODEL_SUMMARY_TERMINAL:
+    model.summary()
+else:
+    print("Model summary terminal print is disabled. See model_summary.txt")
 
 total_params = model.count_params()
 trainable_params = sum([tf.keras.backend.count_params(w) for w in model.trainable_weights])
@@ -559,7 +679,7 @@ print(f"Non-trainable Parameters: {non_trainable_params:,}")
 print(f"Model Size: {total_params * 4 / (1024**2):.2f} MB (assuming float32)")
 
 # Save model summary to file
-with open('model_summary.txt', 'w') as f:
+with open('model_summary.txt', 'w', encoding='utf-8') as f:
     model.summary(print_fn=lambda x: f.write(x + '\n'))
     f.write(f"\nTotal Parameters: {total_params:,}\n")
     f.write(f"Trainable Parameters: {trainable_params:,}\n")
@@ -621,9 +741,7 @@ def display_gradcam_hybrid(img_array, heatmap, true_label, pred_label, confidenc
     plt.axis('off')
     
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.show()
+    finalize_plot(save_path)
 
 
 # --- LIME FOR HYBRID MODEL ---
@@ -639,62 +757,78 @@ print("\n" + "="*50)
 print("EXPLAINABILITY ANALYSIS: LIME & GRAD-CAM")
 print("="*50)
 
-# Run LIME and Grad-CAM on 3 random test images
-for i in range(3):
-    random_idx = random.randint(0, len(test_df) - 1)
-    sample_img_path = test_df['filepath'].iloc[random_idx]
-    true_label = test_df['label'].iloc[random_idx]
-    
-    img = tf.keras.utils.load_img(sample_img_path, target_size=(IMG_SIZE, IMG_SIZE))
-    img_array = tf.keras.utils.img_to_array(img)
-    img_array_expanded = np.expand_dims(img_array, axis=0)
-    
-    preds = model.predict(preprocess_input(img_array_expanded.copy()), verbose=0)
-    pred_idx = np.argmax(preds[0])
-    pred_label = class_names[pred_idx]
-    confidence = np.max(preds[0])
-    
-    print(f"\n--- Image {i+1}: {true_label} (Pred: {pred_label}, {confidence*100:.1f}%) ---")
-    
-    # Grad-CAM on EfficientNetB4 branch - Auto-detect last Conv2D layer
-    print("Computing Grad-CAM on EfficientNetB4 branch...")
-    last_conv_layer = None
-    for layer in reversed(base_model.layers):
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            last_conv_layer = layer.name
-            break
-    if last_conv_layer is None:
-        print("Warning: Could not find Conv2D layer for Grad-CAM")
-    else:
-        heatmap = make_gradcam_heatmap_hybrid(preprocess_input(img_array_expanded.copy()), model, last_conv_layer)
-        display_gradcam_hybrid(img_array_expanded, heatmap, true_label, pred_label, confidence, save_path=f"gradcam_image_{i+1}.png")
-    
-    # LIME on full hybrid model
-    print("Computing LIME explanation (this may take a moment)...")
-    explainer = lime_image.LimeImageExplainer()
-    explanation = explainer.explain_instance(
-        (img_array / 255.0).astype(np.float32),  # LIME expects 0-1 range
-        predict_fn_for_lime,
-        top_labels=3,
-        hide_color=0,
-        num_samples=300
-    )
-    temp, mask = explanation.get_image_and_mask(
-        explanation.top_labels[0],
-        positive_only=True,
-        num_features=10,
-        hide_rest=False
-    )
-    
-    plt.figure(figsize=(10, 6))
-    plt.imshow(mark_boundaries(temp, mask))
-    plt.title(f"LIME Explanation (Full Hybrid Model)\nTrue: {true_label} | Pred: {pred_label}", fontweight='bold')
-    plt.axis('off')
-    plt.tight_layout()
-    plt.savefig(f"lime_explanation_{i+1}.png", dpi=300, bbox_inches="tight")
-    plt.show()
+if RUN_EXPLAINABILITY:
+    # Run LIME and Grad-CAM on 3 random test images
+    for i in range(3):
+        random_idx = random.randint(0, len(test_df) - 1)
+        sample_img_path = test_df['filepath'].iloc[random_idx]
+        true_label = test_df['label'].iloc[random_idx]
+        
+        img = tf.keras.utils.load_img(sample_img_path, target_size=(IMG_SIZE, IMG_SIZE))
+        img_array = tf.keras.utils.img_to_array(img)
+        img_array_expanded = np.expand_dims(img_array, axis=0)
+        
+        preds = model.predict(preprocess_input(img_array_expanded.copy()), verbose=0)
+        pred_idx = np.argmax(preds[0])
+        pred_label = class_names[pred_idx]
+        confidence = np.max(preds[0])
+        
+        print(f"\n--- Image {i+1}: {true_label} (Pred: {pred_label}, {confidence*100:.1f}%) ---")
+        
+        # Grad-CAM on EfficientNetB4 branch - Auto-detect last Conv2D layer
+        print("Computing Grad-CAM on EfficientNetB4 branch...")
+        last_conv_layer = None
+        if base_model is not None:
+            for layer in reversed(base_model.layers):
+                if isinstance(layer, tf.keras.layers.Conv2D):
+                    last_conv_layer = layer.name
+                    break
+        else:
+            for layer in reversed(model.layers):
+                if isinstance(layer, tf.keras.layers.Conv2D):
+                    last_conv_layer = layer.name
+                    break
+        if last_conv_layer is None:
+            print("Warning: Could not find Conv2D layer for Grad-CAM")
+        else:
+            heatmap = make_gradcam_heatmap_hybrid(preprocess_input(img_array_expanded.copy()), model, last_conv_layer)
+            display_gradcam_hybrid(img_array_expanded, heatmap, true_label, pred_label, confidence, save_path=f"gradcam_image_{i+1}.png")
+        
+        # LIME on full hybrid model
+        print("Computing LIME explanation (this may take a moment)...")
+        explainer = lime_image.LimeImageExplainer()
+        explanation = explainer.explain_instance(
+            (img_array / 255.0).astype(np.float32),  # LIME expects 0-1 range
+            predict_fn_for_lime,
+            top_labels=3,
+            hide_color=0,
+            num_samples=300
+        )
+        temp, mask = explanation.get_image_and_mask(
+            explanation.top_labels[0],
+            positive_only=True,
+            num_features=10,
+            hide_rest=False
+        )
+        
+        plt.figure(figsize=(10, 6))
+        plt.imshow(mark_boundaries(temp, mask))
+        plt.title(f"LIME Explanation (Full Hybrid Model)\nTrue: {true_label} | Pred: {pred_label}", fontweight='bold')
+        plt.axis('off')
+        plt.tight_layout()
+        finalize_plot(f"lime_explanation_{i+1}.png")
 
-print("\n" + "="*50)
-print("Explanation analysis complete!")
-print("="*50)
+    print("\n" + "="*50)
+    print("Explanation analysis complete!")
+    print("="*50)
+else:
+    print("Explainability stage skipped. Set RUN_EXPLAINABILITY=1 to enable it.")
 
+if EXPORTED_FIGURES:
+    print("\n" + "="*50)
+    print("EXPORTED FIGURES")
+    print("="*50)
+    for fig_path in sorted(set(EXPORTED_FIGURES)):
+        print(fig_path.resolve())
+
+ 
