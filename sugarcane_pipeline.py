@@ -1,6 +1,7 @@
 import os
 import random
 import hashlib
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -15,9 +16,9 @@ from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, Glob
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.optimizers import Adam, RMSprop
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, accuracy_score, matthews_corrcoef, cohen_kappa_score, precision_recall_curve, average_precision_score
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, accuracy_score, matthews_corrcoef, cohen_kappa_score, precision_recall_curve, average_precision_score, roc_auc_score
 from sklearn.preprocessing import label_binarize
 
 import optuna
@@ -41,6 +42,10 @@ FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 SHOW_FIGURES = os.environ.get("SHOW_FIGURES", "0") == "1"
 RUN_EXPLAINABILITY = os.environ.get("RUN_EXPLAINABILITY", "1") == "1"
 FORCE_RETRAIN = os.environ.get("FORCE_RETRAIN", "0") == "1"
+RUN_KFOLD_CV = os.environ.get("RUN_KFOLD_CV", "1") == "1"
+K_FOLDS = int(os.environ.get("K_FOLDS", "5"))
+CV_EPOCHS_INITIAL = int(os.environ.get("CV_EPOCHS_INITIAL", "20"))
+CV_EPOCHS_FINETUNE = int(os.environ.get("CV_EPOCHS_FINETUNE", "10"))
 PRINT_MODEL_SUMMARY_TERMINAL = os.environ.get("PRINT_MODEL_SUMMARY_TERMINAL", "0") == "1"
 FIGURE_DPI = int(os.environ.get("FIGURE_DPI", "600"))
 FIGURE_FORMATS = tuple(
@@ -64,6 +69,7 @@ print(
     f"FORCE_RETRAIN={FORCE_RETRAIN} | PRINT_MODEL_SUMMARY_TERMINAL={PRINT_MODEL_SUMMARY_TERMINAL} | "
     f"FIGURE_DPI={FIGURE_DPI} | FIGURE_FORMATS={FIGURE_FORMATS}"
 )
+print(f"RUN_KFOLD_CV={RUN_KFOLD_CV} | K_FOLDS={K_FOLDS} | CV_EPOCHS_INITIAL={CV_EPOCHS_INITIAL} | CV_EPOCHS_FINETUNE={CV_EPOCHS_FINETUNE}")
 
 def finalize_plot(filename=None):
     """Save current figure in all requested formats and optionally show it."""
@@ -686,6 +692,381 @@ with open('model_summary.txt', 'w', encoding='utf-8') as f:
     f.write(f"Non-trainable Parameters: {non_trainable_params:,}\n")
     f.write(f"Model Size: {total_params * 4 / (1024**2):.2f} MB (assuming float32)\n")
 print("Model summary saved to model_summary.txt")
+
+# ==========================================
+# 6.11 K-FOLD STRATIFIED CROSS-VALIDATION (RESEARCH-LEVEL VALIDATION)
+# ==========================================
+if RUN_KFOLD_CV:
+    print("\n" + "="*60)
+    print(f"K-FOLD STRATIFIED CROSS-VALIDATION ({K_FOLDS}-FOLD)")
+    print("="*60)
+
+    # Load best hyperparameters from Optuna study
+    try:
+        cv_study = optuna.load_study(
+            study_name="sugarcane_efficientnet_study",
+            storage="sqlite:///sugarcane_optuna_study.db"
+        )
+        cv_best_params = cv_study.best_params
+        print(f"Loaded best hyperparameters from Optuna study: {cv_best_params}")
+    except Exception as e:
+        print(f"Warning: Could not load Optuna study for CV params: {e}")
+        cv_best_params = {
+            "learning_rate": 1e-4,
+            "dropout_rate": 0.3,
+            "optimizer": "Adam",
+            "dense_units": 256,
+        }
+        print(f"Using default hyperparameters for CV: {cv_best_params}")
+
+    # Combine train and validation sets for cross-validation
+    # (test set remains held-out for final evaluation)
+    cv_df = pd.concat([train_df, val_df], ignore_index=True)
+    print(f"Cross-validation dataset size: {len(cv_df)} images")
+    print(f"Class distribution:\n{cv_df['label'].value_counts()}")
+
+    # Initialize StratifiedKFold (stratified to maintain class balance)
+    skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
+
+    # Storage for per-fold results
+    fold_results = []
+    fold_histories = []
+    all_fold_true = []
+    all_fold_pred = []
+    all_fold_pred_proba = []
+
+    print(f"\nStarting {K_FOLDS}-fold stratified cross-validation...")
+    print(f"Each fold: {CV_EPOCHS_INITIAL} initial epochs + {CV_EPOCHS_FINETUNE} fine-tune epochs")
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(cv_df['filepath'], cv_df['label'])):
+        print(f"\n{'='*50}")
+        print(f"FOLD {fold_idx + 1}/{K_FOLDS}")
+        print(f"{'='*50}")
+
+        fold_train_df = cv_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = cv_df.iloc[val_idx].reset_index(drop=True)
+
+        print(f"Train: {len(fold_train_df)} | Val: {len(fold_val_df)}")
+
+        # Create data generators for this fold
+        fold_train_generator = train_datagen.flow_from_dataframe(
+            fold_train_df, x_col='filepath', y_col='label',
+            target_size=(IMG_SIZE, IMG_SIZE), batch_size=BATCH_SIZE,
+            class_mode='categorical', shuffle=True
+        )
+        fold_val_generator = test_datagen.flow_from_dataframe(
+            fold_val_df, x_col='filepath', y_col='label',
+            target_size=(IMG_SIZE, IMG_SIZE), batch_size=BATCH_SIZE,
+            class_mode='categorical', shuffle=False
+        )
+
+        # Compute class weights for this fold's training data
+        fold_class_weights = compute_class_weight(
+            class_weight='balanced',
+            classes=np.unique(fold_train_generator.classes),
+            y=fold_train_generator.classes
+        )
+        fold_weight_dict = dict(enumerate(fold_class_weights))
+
+        # Clear session and build fresh model for this fold
+        tf.keras.backend.clear_session()
+        fold_model, fold_base_model = build_hybrid_model(
+            dense_units=cv_best_params["dense_units"],
+            dropout_rate=cv_best_params["dropout_rate"],
+            learning_rate=cv_best_params["learning_rate"],
+            optimizer_name=cv_best_params["optimizer"],
+            num_classes=len(class_names),
+        )
+
+        # Callbacks for this fold
+        fold_callbacks = [
+            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3),
+        ]
+
+        # Train initial phase (frozen backbone)
+        print(f"Fold {fold_idx + 1}: Training initial phase ({CV_EPOCHS_INITIAL} epochs)...")
+        fold_history = fold_model.fit(
+            fold_train_generator, validation_data=fold_val_generator,
+            epochs=CV_EPOCHS_INITIAL, class_weight=fold_weight_dict,
+            callbacks=fold_callbacks, verbose=1
+        )
+
+        # Fine-tuning phase (unfreeze top layers)
+        print(f"Fold {fold_idx + 1}: Fine-tuning ({CV_EPOCHS_FINETUNE} epochs)...")
+        for layer in fold_base_model.layers[-50:]:
+            if not isinstance(layer, tf.keras.layers.BatchNormalization):
+                layer.trainable = True
+
+        fold_model.compile(
+            optimizer=Adam(learning_rate=1e-5),
+            loss='categorical_crossentropy', metrics=['accuracy']
+        )
+        fold_history_finetune = fold_model.fit(
+            fold_train_generator, validation_data=fold_val_generator,
+            epochs=CV_EPOCHS_FINETUNE, class_weight=fold_weight_dict,
+            callbacks=fold_callbacks, verbose=1
+        )
+
+        # Evaluate on validation fold
+        fold_val_generator.reset()
+        fold_pred = fold_model.predict(fold_val_generator, verbose=0)
+        fold_pred_class = np.argmax(fold_pred, axis=1)
+        fold_true_class = fold_val_generator.classes
+
+        # Compute comprehensive metrics for this fold
+        fold_acc = accuracy_score(fold_true_class, fold_pred_class)
+        fold_report = classification_report(
+            fold_true_class, fold_pred_class,
+            target_names=class_names, output_dict=True
+        )
+        fold_mcc = matthews_corrcoef(fold_true_class, fold_pred_class)
+        fold_kappa = cohen_kappa_score(fold_true_class, fold_pred_class)
+
+        # ROC-AUC (macro, one-vs-rest)
+        fold_y_bin = label_binarize(fold_true_class, classes=np.arange(len(class_names)))
+        try:
+            fold_roc_auc = roc_auc_score(fold_y_bin, fold_pred, multi_class='ovr', average='macro')
+        except Exception:
+            fold_roc_auc = 0.0
+
+        fold_result = {
+            'fold': fold_idx + 1,
+            'accuracy': fold_acc,
+            'precision_macro': fold_report['macro avg']['precision'],
+            'recall_macro': fold_report['macro avg']['recall'],
+            'f1_macro': fold_report['macro avg']['f1-score'],
+            'precision_weighted': fold_report['weighted avg']['precision'],
+            'recall_weighted': fold_report['weighted avg']['recall'],
+            'f1_weighted': fold_report['weighted avg']['f1-score'],
+            'mcc': fold_mcc,
+            'kappa': fold_kappa,
+            'roc_auc_macro': fold_roc_auc,
+        }
+        fold_results.append(fold_result)
+
+        # Store predictions for aggregated metrics
+        all_fold_true.extend(fold_true_class)
+        all_fold_pred.extend(fold_pred_class)
+        all_fold_pred_proba.append(fold_pred)
+
+        # Store histories for plotting
+        fold_histories.append({
+            'initial': fold_history.history,
+            'finetune': fold_history_finetune.history,
+        })
+
+        print(f"\nFold {fold_idx + 1} Results:")
+        print(f"  Accuracy: {fold_acc:.4f}")
+        print(f"  F1 (Macro): {fold_report['macro avg']['f1-score']:.4f}")
+        print(f"  MCC: {fold_mcc:.4f}")
+        print(f"  Kappa: {fold_kappa:.4f}")
+        print(f"  ROC-AUC (Macro): {fold_roc_auc:.4f}")
+
+        # Clean up to free GPU memory before next fold
+        del fold_model, fold_base_model
+        tf.keras.backend.clear_session()
+
+    # ==========================================
+    # 6.12 K-FOLD CV AGGREGATED RESULTS
+    # ==========================================
+    print("\n" + "="*60)
+    print("K-FOLD CROSS-VALIDATION AGGREGATED RESULTS")
+    print("="*60)
+
+    cv_results_df = pd.DataFrame(fold_results)
+    print("\nPer-Fold Results:")
+    print(cv_results_df.to_string(index=False))
+
+    # Compute mean and std for all metrics
+    metric_cols = ['accuracy', 'precision_macro', 'recall_macro', 'f1_macro',
+                   'precision_weighted', 'recall_weighted', 'f1_weighted',
+                   'mcc', 'kappa', 'roc_auc_macro']
+
+    print("\n" + "-"*60)
+    print(f"Aggregated Metrics (Mean ± Std) over {K_FOLDS} folds:")
+    print("-"*60)
+    for col in metric_cols:
+        mean_val = cv_results_df[col].mean()
+        std_val = cv_results_df[col].std()
+        print(f"  {col:25s}: {mean_val:.4f} ± {std_val:.4f}")
+
+    # Save per-fold CV results to CSV
+    cv_results_path = Path("cv_results.csv")
+    cv_results_df.to_csv(cv_results_path, index=False)
+    print(f"\nCV per-fold results saved to: {cv_results_path.resolve()}")
+
+    # Save aggregated summary as JSON (for reproducibility and paper reporting)
+    cv_summary = {
+        'n_folds': K_FOLDS,
+        'total_samples': len(cv_df),
+        'epochs_initial': CV_EPOCHS_INITIAL,
+        'epochs_finetune': CV_EPOCHS_FINETUNE,
+        'random_seed': SEED,
+        'hyperparameters': cv_best_params,
+        'metrics': {}
+    }
+    for col in metric_cols:
+        cv_summary['metrics'][col] = {
+            'mean': float(cv_results_df[col].mean()),
+            'std': float(cv_results_df[col].std()),
+            'min': float(cv_results_df[col].min()),
+            'max': float(cv_results_df[col].max()),
+        }
+
+    cv_summary_path = Path("cv_results_summary.json")
+    with open(cv_summary_path, 'w', encoding='utf-8') as f:
+        json.dump(cv_summary, f, indent=2)
+    print(f"CV summary saved to: {cv_summary_path.resolve()}")
+
+    # ==========================================
+    # 6.13 K-FOLD CV VISUALIZATIONS
+    # ==========================================
+    print("\nGenerating K-Fold CV visualizations...")
+
+    # --- Box plot of per-fold metric distributions ---
+    plt.figure(figsize=(14, 6))
+    box_data = [cv_results_df[col].values for col in metric_cols]
+    box_labels = [col.replace('_', ' ').title() for col in metric_cols]
+    plt.boxplot(box_data, patch_artist=True)
+    plt.xticks(range(1, len(box_labels) + 1), box_labels, rotation=45, ha='right')
+    plt.ylabel('Score')
+    plt.title(f'K-Fold CV Metric Distribution ({K_FOLDS} Folds)')
+    plt.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    finalize_plot("cv_metrics_boxplot.png")
+
+    # --- Per-fold accuracy bar chart with mean and std band ---
+    plt.figure(figsize=(10, 5))
+    plt.bar(cv_results_df['fold'], cv_results_df['accuracy'], color='#4C72B0', alpha=0.8)
+    mean_acc = cv_results_df['accuracy'].mean()
+    std_acc = cv_results_df['accuracy'].std()
+    plt.axhline(y=mean_acc, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_acc:.4f}')
+    plt.fill_between(
+        [0.5, K_FOLDS + 0.5],
+        mean_acc - std_acc,
+        mean_acc + std_acc,
+        alpha=0.2, color='red', label=f'± 1 Std ({std_acc:.4f})'
+    )
+    plt.xlabel('Fold')
+    plt.ylabel('Accuracy')
+    plt.title(f'Per-Fold Accuracy ({K_FOLDS}-Fold CV)')
+    plt.legend()
+    plt.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    finalize_plot("cv_accuracy_per_fold.png")
+
+    # --- Aggregated confusion matrix across all folds ---
+    all_fold_true_arr = np.array(all_fold_true)
+    all_fold_pred_arr = np.array(all_fold_pred)
+    cv_cm = confusion_matrix(all_fold_true_arr, all_fold_pred_arr)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cv_cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title(f'Aggregated Confusion Matrix ({K_FOLDS}-Fold CV)')
+    finalize_plot("cv_confusion_matrix.png")
+
+    # --- Per-fold Precision/Recall/F1 grouped bar chart ---
+    plt.figure(figsize=(12, 6))
+    x = np.arange(K_FOLDS)
+    width = 0.25
+    plt.bar(x - width, cv_results_df['precision_macro'], width, label='Precision (Macro)', color='#4C72B0')
+    plt.bar(x, cv_results_df['recall_macro'], width, label='Recall (Macro)', color='#55A868')
+    plt.bar(x + width, cv_results_df['f1_macro'], width, label='F1 (Macro)', color='#C44E52')
+    plt.xlabel('Fold')
+    plt.ylabel('Score')
+    plt.title(f'Per-Fold Precision/Recall/F1 ({K_FOLDS}-Fold CV)')
+    plt.xticks(x, [f'Fold {i+1}' for i in range(K_FOLDS)])
+    plt.legend()
+    plt.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    finalize_plot("cv_metrics_per_fold.png")
+
+    # --- Aggregated ROC-AUC curve across all folds ---
+    all_fold_pred_proba_arr = np.vstack(all_fold_pred_proba)
+    all_fold_true_bin = label_binarize(all_fold_true_arr, classes=np.arange(len(class_names)))
+
+    plt.figure(figsize=(8, 6))
+    for i in range(len(class_names)):
+        fpr, tpr, _ = roc_curve(all_fold_true_bin[:, i], all_fold_pred_proba_arr[:, i])
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, lw=2, label=f'{class_names[i]} (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'Aggregated ROC-AUC Curve ({K_FOLDS}-Fold CV)')
+    plt.legend(loc='lower right')
+    plt.grid(True, alpha=0.3)
+    finalize_plot("cv_roc_auc_curve.png")
+
+    # --- Fold-wise training curves overlay ---
+    if fold_histories:
+        plt.figure(figsize=(14, 5))
+
+        # Accuracy
+        plt.subplot(1, 2, 1)
+        for i, fh in enumerate(fold_histories):
+            all_acc = fh['initial']['accuracy'] + fh['finetune']['accuracy']
+            all_val_acc = fh['initial']['val_accuracy'] + fh['finetune']['val_accuracy']
+            epochs = range(1, len(all_acc) + 1)
+            plt.plot(epochs, all_acc, alpha=0.5, label=f'Fold {i+1} Train' if i == 0 else '')
+            plt.plot(epochs, all_val_acc, alpha=0.5, linestyle='--', label=f'Fold {i+1} Val' if i == 0 else '')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.title('Training Curves Across All Folds')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Loss
+        plt.subplot(1, 2, 2)
+        for i, fh in enumerate(fold_histories):
+            all_loss = fh['initial']['loss'] + fh['finetune']['loss']
+            all_val_loss = fh['initial']['val_loss'] + fh['finetune']['val_loss']
+            epochs = range(1, len(all_loss) + 1)
+            plt.plot(epochs, all_loss, alpha=0.5, label=f'Fold {i+1} Train' if i == 0 else '')
+            plt.plot(epochs, all_val_loss, alpha=0.5, linestyle='--', label=f'Fold {i+1} Val' if i == 0 else '')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Loss Curves Across All Folds')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        finalize_plot("cv_training_curves.png")
+
+    print("\n" + "="*60)
+    print("K-FOLD CROSS-VALIDATION COMPLETE")
+    print("="*60)
+    print(f"\nFinal CV Accuracy:   {cv_results_df['accuracy'].mean():.4f} ± {cv_results_df['accuracy'].std():.4f}")
+    print(f"Final CV F1 (Macro): {cv_results_df['f1_macro'].mean():.4f} ± {cv_results_df['f1_macro'].std():.4f}")
+    print(f"Final CV MCC:        {cv_results_df['mcc'].mean():.4f} ± {cv_results_df['mcc'].std():.4f}")
+    print(f"Final CV Kappa:      {cv_results_df['kappa'].mean():.4f} ± {cv_results_df['kappa'].std():.4f}")
+    print(f"Final CV ROC-AUC:    {cv_results_df['roc_auc_macro'].mean():.4f} ± {cv_results_df['roc_auc_macro'].std():.4f}")
+
+    # Reload the main model after CV, since clear_session() in the CV loop
+    # invalidates the previously trained model object needed for explainability
+    if RUN_EXPLAINABILITY and FINAL_MODEL_PATH.exists():
+        print("\nReloading main model for explainability analysis...")
+        tf.keras.backend.clear_session()
+        model = tf.keras.models.load_model(
+            FINAL_MODEL_PATH,
+            custom_objects={
+                "Patches": Patches,
+                "PatchEncoder": PatchEncoder,
+                "SEBlock": SEBlock,
+            },
+            compile=False,
+        )
+        model.compile(optimizer=Adam(learning_rate=1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+        try:
+            base_model = model.get_layer("efficientnetb4")
+        except ValueError:
+            base_model = None
+            print("Warning: EfficientNet backbone layer not found by name in reloaded model.")
+else:
+    print("\nK-Fold cross-validation skipped. Set RUN_KFOLD_CV=1 to enable.")
 
 # ==========================================
 # 7. EXPLAINABLE AI (LIME & GRAD-CAM) FOR HYBRID MODEL
