@@ -51,6 +51,7 @@ FIGURE_DPI = int(os.environ.get("FIGURE_DPI", "600"))
 FIGURE_FORMATS = tuple(
     fmt.strip().lower() for fmt in os.environ.get("FIGURE_FORMATS", "png,pdf").split(",") if fmt.strip()
 )
+GRADCAM_PER_CLASS = int(os.environ.get("GRADCAM_PER_CLASS", "2"))
 EXPORTED_FIGURES = []
 
 plt.rcParams.update({
@@ -152,13 +153,13 @@ duplicates = len(train_test_overlap) + len(train_val_overlap) + len(val_test_ove
 
 if duplicates:
     print(
-        "⚠️ Leakage check failed! "
+        "Leakage check failed! "
         f"train-test: {len(train_test_overlap)}, "
         f"train-val: {len(train_val_overlap)}, "
         f"val-test: {len(val_test_overlap)}"
     )
 else:
-    print("✅ No identical image files found across train/val/test splits! (No Data Leakage)")
+    print("No identical image files found across train/val/test splits! (No Data Leakage)")
 
 # ==========================================
 # 2. DATA GENERATORS & AUGMENTATION
@@ -694,6 +695,497 @@ with open('model_summary.txt', 'w', encoding='utf-8') as f:
 print("Model summary saved to model_summary.txt")
 
 # ==========================================
+# 7. EXPLAINABLE AI (LIME & GRAD-CAM) FOR HYBRID MODEL
+# ==========================================
+
+# --- GRAD-CAM FOR EFFICIENTNET BRANCH ---
+def make_gradcam_heatmap_hybrid(img_array, hybrid_model, last_conv_layer_name, pred_index=None):
+    """Grad-CAM for the EfficientNetB4 branch of the hybrid model."""
+    grad_model = tf.keras.models.Model(
+        inputs=hybrid_model.inputs,
+        outputs=[hybrid_model.get_layer(last_conv_layer_name).output, hybrid_model.output]
+    )
+    
+    with tf.GradientTape() as tape:
+        last_conv_layer_output, preds = grad_model(img_array, training=False)
+        if pred_index is None:
+            pred_index = tf.argmax(preds[0])
+        class_channel = preds[:, pred_index]
+    
+    grads = tape.gradient(class_channel, last_conv_layer_output)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    last_conv_layer_output = last_conv_layer_output[0]
+    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    return heatmap.numpy()
+
+
+def display_gradcam_hybrid(img_array, heatmap, true_label, pred_label, confidence, alpha=0.5, save_path=None):
+    """Display Grad-CAM result with original image and heatmap overlay."""
+    img = np.uint8(img_array[0])
+    
+    heatmap_resized = tf.image.resize(heatmap[np.newaxis, :, :, np.newaxis], (IMG_SIZE, IMG_SIZE))
+    heatmap_resized = heatmap_resized[0, :, :, 0].numpy()
+    
+    heatmap_colored = np.uint8(255 * heatmap_resized)
+    jet = plt.colormaps.get_cmap("jet")
+    jet_colors = jet(np.arange(256))[:, :3]
+    jet_heatmap = jet_colors[heatmap_colored]
+    
+    superimposed_img = np.uint8(alpha * (jet_heatmap * 255) + (1 - alpha) * img)
+    
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.imshow(img)
+    plt.title(f"Original Image\nTrue: {true_label}", fontweight='bold')
+    plt.axis('off')
+    
+    plt.subplot(1, 2, 2)
+    plt.imshow(superimposed_img)
+    plt.title(f"Grad-CAM (EfficientNet Branch)\nPred: {pred_label} ({confidence*100:.1f}%)", fontweight='bold')
+    plt.axis('off')
+    
+    plt.tight_layout()
+    finalize_plot(save_path)
+
+
+# --- LIME FOR HYBRID MODEL ---
+def predict_fn_for_lime(images):
+    """Wrapper for LIME to predict on the hybrid model."""
+    images = preprocess_input(images.copy())
+    if images.ndim == 3:
+        images = np.expand_dims(images, axis=0)
+    return model.predict(images, verbose=0)
+
+
+print("\n" + "="*50)
+print("EXPLAINABILITY ANALYSIS: LIME & GRAD-CAM")
+print("="*50)
+
+
+# ==========================================
+# 7.5 PAPER-QUALITY GRAD-CAM GRID FIGURE
+# ==========================================
+
+def select_representative_images(test_df, pred_classes, pred_probs, class_names, n_per_class=3):
+    """
+    Select diverse representative images per class for paper figure.
+    Strategy per class:
+      1. Highest-confidence correct prediction
+      2. Lowest-confidence correct prediction
+      3. A misclassified image (if available), else next-best correct
+    """
+    selected_indices = []
+    selected_labels = []
+
+    label_to_idx = {name: idx for idx, name in enumerate(class_names)}
+
+    for cls_name in class_names:
+        cls_idx = label_to_idx[cls_name]
+        # Indices in test_df where the true label matches this class
+        mask = test_df['label'].values == cls_name
+        class_positions = np.where(mask)[0]
+
+        if len(class_positions) == 0:
+            continue
+
+        # Separate correctly classified and misclassified
+        correct_positions = [p for p in class_positions if pred_classes[p] == cls_idx]
+        wrong_positions = [p for p in class_positions if pred_classes[p] != cls_idx]
+
+        # Sort correct by confidence of true class (descending)
+        correct_confs = [(p, pred_probs[p][cls_idx]) for p in correct_positions]
+        correct_confs.sort(key=lambda x: x[1], reverse=True)
+
+        chosen = []
+
+        # 1. Highest-confidence correct
+        if correct_confs:
+            chosen.append(correct_confs[0][0])
+
+        # 2. Lowest-confidence correct
+        if len(correct_confs) >= 2:
+            chosen.append(correct_confs[-1][0])
+
+        # 3. Misclassified (highest confidence in wrong class)
+        if wrong_positions and len(chosen) < n_per_class:
+            wrong_confs = [(p, np.max(pred_probs[p])) for p in wrong_positions]
+            wrong_confs.sort(key=lambda x: x[1], reverse=True)
+            chosen.append(wrong_confs[0][0])
+
+        # Fill remaining slots with other correct predictions
+        if len(chosen) < n_per_class and len(correct_confs) > 2:
+            mid_idx = len(correct_confs) // 2
+            for ci in range(mid_idx, len(correct_confs)):
+                if correct_confs[ci][0] not in chosen:
+                    chosen.append(correct_confs[ci][0])
+                    if len(chosen) >= n_per_class:
+                        break
+
+        # If still not enough, pad with whatever is available
+        if len(chosen) < n_per_class:
+            for p in class_positions:
+                if p not in chosen:
+                    chosen.append(p)
+                    if len(chosen) >= n_per_class:
+                        break
+
+        chosen = chosen[:n_per_class]
+        selected_indices.extend(chosen)
+        selected_labels.extend([cls_name] * len(chosen))
+
+    return selected_indices, selected_labels
+
+
+def generate_paper_gradcam_grid(model, test_df, pred_classes, pred_probs,
+                                class_names, last_conv_layer,
+                                n_per_class=3, heatmap_alpha=0.4):
+    """
+    Generate a publication-ready Grad-CAM grid figure (Fig. 5 style).
+    Top row: original images with true labels.
+    Bottom row: Grad-CAM heatmap overlays with predictions & confidence.
+    Images are grouped by class.
+    """
+    if last_conv_layer is None:
+        print("Warning: No Conv2D layer found. Skipping Grad-CAM grid.")
+        return
+
+    indices, labels = select_representative_images(
+        test_df, pred_classes, pred_probs, class_names, n_per_class
+    )
+
+    if not indices:
+        print("Warning: No images selected for Grad-CAM grid.")
+        return
+
+    n_images = len(indices)
+    print(f"\nGenerating paper Grad-CAM grid with {n_images} images "
+          f"({n_per_class} per class × {len(class_names)} classes)...")
+
+    # Prepare all images and heatmaps
+    original_images = []
+    superimposed_images = []
+    true_labels = []
+    pred_labels = []
+    confidences = []
+
+    for idx in indices:
+        img_path = test_df['filepath'].iloc[idx]
+        true_label = test_df['label'].iloc[idx]
+
+        # Load and preprocess image
+        img = tf.keras.utils.load_img(img_path, target_size=(IMG_SIZE, IMG_SIZE))
+        img_array = tf.keras.utils.img_to_array(img)
+        img_array_expanded = np.expand_dims(img_array, axis=0)
+        img_preprocessed = preprocess_input(img_array_expanded.copy())
+
+        # Get prediction
+        pred_idx = pred_classes[idx]
+        pred_label = class_names[pred_idx]
+        confidence = np.max(pred_probs[idx])
+
+        # Generate Grad-CAM heatmap
+        heatmap = make_gradcam_heatmap_hybrid(img_preprocessed, model, last_conv_layer)
+
+        # Create superimposed image
+        img_uint8 = np.uint8(img_array)
+        heatmap_resized = tf.image.resize(
+            heatmap[np.newaxis, :, :, np.newaxis], (IMG_SIZE, IMG_SIZE)
+        )
+        heatmap_resized = heatmap_resized[0, :, :, 0].numpy()
+        heatmap_colored = np.uint8(255 * heatmap_resized)
+        jet = plt.colormaps.get_cmap("jet")
+        jet_colors = jet(np.arange(256))[:, :3]
+        jet_heatmap = jet_colors[heatmap_colored]
+        superimposed = np.uint8(
+            heatmap_alpha * (jet_heatmap * 255) + (1 - heatmap_alpha) * img_uint8
+        )
+
+        original_images.append(img_uint8)
+        superimposed_images.append(superimposed)
+        true_labels.append(true_label)
+        pred_labels.append(pred_label)
+        confidences.append(confidence)
+
+    # --- Build the 2-row grid figure ---
+    col_width = 2.2
+    row_height = 2.2  # Match column width for square images
+    fig_width = n_images * col_width + 0.5  # matching LIME grid width
+    fig_height = 2 * row_height + 0.5  # reduced padding
+
+    fig, axes = plt.subplots(
+        2, n_images,
+        figsize=(fig_width, fig_height),
+        gridspec_kw={'hspace': 0.02, 'wspace': 0.05}
+    )
+
+    # Handle case where n_images == 1 (axes wouldn't be 2D)
+    if n_images == 1:
+        axes = axes.reshape(2, 1)
+
+    for col_idx in range(n_images):
+        # Top row: Original image
+        ax_orig = axes[0, col_idx]
+        ax_orig.imshow(original_images[col_idx])
+        ax_orig.set_title(
+            f"image={true_labels[col_idx]}",
+            fontsize=7, fontweight='bold', pad=4
+        )
+        ax_orig.axis('off')
+
+        # Bottom row: Grad-CAM overlay
+        ax_cam = axes[1, col_idx]
+        ax_cam.imshow(superimposed_images[col_idx])
+
+        # Color-code prediction: green if correct, red if wrong
+        is_correct = true_labels[col_idx] == pred_labels[col_idx]
+        title_color = '#006400' if is_correct else '#8B0000'
+        ax_cam.set_title(
+            f"pred={pred_labels[col_idx]} ({confidences[col_idx]*100:.1f}%)",
+            fontsize=7, fontweight='bold', pad=4, color=title_color
+        )
+        ax_cam.axis('off')
+
+    # Add class group separators (vertical lines between class groups)
+    for class_boundary in range(1, len(class_names)):
+        sep_x = class_boundary * n_per_class - 0.5
+        for row in range(2):
+            axes[row, min(class_boundary * n_per_class, n_images - 1)].axvline(
+                x=-0.5, color='white', linewidth=3
+            ) if class_boundary * n_per_class < n_images else None
+
+    # Colorbar removed per user request
+
+    fig.suptitle(
+        'Grad-CAM Heatmaps for Representative Test Images',
+        fontsize=11, fontweight='bold', y=0.98
+    )
+
+    finalize_plot("gradcam_grid_paper.png")
+    print("Paper-quality Grad-CAM grid figure saved.")
+
+    # --- Also save individual high-res pairs for flexible paper layout ---
+    print("Saving individual high-res Grad-CAM pairs...")
+    for i in range(n_images):
+        fig_ind, (ax1, ax2) = plt.subplots(1, 2, figsize=(6, 3))
+
+        ax1.imshow(original_images[i])
+        ax1.set_title(f"Original\n{true_labels[i]}", fontsize=9, fontweight='bold')
+        ax1.axis('off')
+
+        ax2.imshow(superimposed_images[i])
+        is_correct = true_labels[i] == pred_labels[i]
+        title_color = '#006400' if is_correct else '#8B0000'
+        ax2.set_title(
+            f"Grad-CAM\n{pred_labels[i]} ({confidences[i]*100:.1f}%)",
+            fontsize=9, fontweight='bold', color=title_color
+        )
+        ax2.axis('off')
+
+        fig_ind.tight_layout()
+        finalize_plot(f"gradcam_pair_{true_labels[i]}_{i+1}.png")
+
+    print(f"Saved {n_images} individual Grad-CAM pair figures.")
+
+
+print("\n" + "="*50)
+print("PAPER-QUALITY GRAD-CAM GRID GENERATION")
+print("="*50)
+
+if RUN_EXPLAINABILITY:
+    # Auto-detect last Conv2D layer for Grad-CAM
+    last_conv_layer_for_grid = None
+    try:
+        base_model_ref = model.get_layer("efficientnetb4")
+        for layer in reversed(base_model_ref.layers):
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                last_conv_layer_for_grid = layer.name
+                break
+    except ValueError:
+        for layer in reversed(model.layers):
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                last_conv_layer_for_grid = layer.name
+                break
+
+    if last_conv_layer_for_grid:
+        print(f"Using Conv2D layer for Grad-CAM: {last_conv_layer_for_grid}")
+        print(f"Images per class: {GRADCAM_PER_CLASS}")
+
+        # Use predictions already computed during evaluation (pred, pred_class, true_class)
+        generate_paper_gradcam_grid(
+            model=model,
+            test_df=test_df,
+            pred_classes=pred_class,
+            pred_probs=pred,
+            class_names=class_names,
+            last_conv_layer=last_conv_layer_for_grid,
+            n_per_class=GRADCAM_PER_CLASS,
+            heatmap_alpha=0.4,
+        )
+    else:
+        print("Warning: Could not find Conv2D layer for Grad-CAM grid.")
+else:
+    print("Grad-CAM grid skipped. Set RUN_EXPLAINABILITY=1 to enable.")
+
+# ==========================================
+# 7.6 PAPER-QUALITY LIME GRID FIGURE
+# ==========================================
+
+def generate_paper_lime_grid(model, test_df, pred_classes, pred_probs,
+                              class_names, n_per_class=3):
+    """
+    Generate a publication-ready LIME grid figure (Fig. 5 style).
+    Top row: original images with true labels.
+    Bottom row: LIME explanation overlays with predictions & confidence.
+    Images are grouped by class.
+    """
+    indices, labels = select_representative_images(
+        test_df, pred_classes, pred_probs, class_names, n_per_class
+    )
+
+    if not indices:
+        print("Warning: No images selected for LIME grid.")
+        return
+
+    n_images = len(indices)
+    print(f"\nGenerating paper LIME grid with {n_images} images "
+          f"({n_per_class} per class × {len(class_names)} classes)...")
+
+    # Prepare all images and LIME explanations
+    original_images = []
+    lime_images = []
+    true_labels = []
+    pred_labels = []
+    confidences = []
+
+    explainer = lime_image.LimeImageExplainer()
+
+    for img_idx, idx in enumerate(indices):
+        img_path = test_df['filepath'].iloc[idx]
+        true_label = test_df['label'].iloc[idx]
+
+        # Load image
+        img = tf.keras.utils.load_img(img_path, target_size=(IMG_SIZE, IMG_SIZE))
+        img_array = tf.keras.utils.img_to_array(img)
+
+        # Get prediction
+        pred_idx_val = pred_classes[idx]
+        pred_label = class_names[pred_idx_val]
+        confidence = np.max(pred_probs[idx])
+
+        # Generate LIME explanation
+        print(f"  Computing LIME for image {img_idx + 1}/{n_images} "
+              f"(true={true_label}, pred={pred_label})...")
+        explanation = explainer.explain_instance(
+            (img_array / 255.0).astype(np.float32),
+            predict_fn_for_lime,
+            top_labels=3,
+            hide_color=0,
+            num_samples=300
+        )
+        temp, mask = explanation.get_image_and_mask(
+            explanation.top_labels[0],
+            positive_only=True,
+            num_features=10,
+            hide_rest=False
+        )
+        lime_overlay = mark_boundaries(temp, mask)
+
+        original_images.append(np.uint8(img_array))
+        lime_images.append(lime_overlay)
+        true_labels.append(true_label)
+        pred_labels.append(pred_label)
+        confidences.append(confidence)
+
+    # --- Build the 2-row grid figure ---
+    col_width = 2.2
+    row_height = 2.2  # Match column width for square images
+    fig_width = n_images * col_width + 0.5
+    fig_height = 2 * row_height + 0.5  # reduced padding
+
+    fig, axes = plt.subplots(
+        2, n_images,
+        figsize=(fig_width, fig_height),
+        gridspec_kw={'hspace': 0.02, 'wspace': 0.05}
+    )
+
+    if n_images == 1:
+        axes = axes.reshape(2, 1)
+
+    for col_idx in range(n_images):
+        # Top row: Original image
+        ax_orig = axes[0, col_idx]
+        ax_orig.imshow(original_images[col_idx])
+        ax_orig.set_title(
+            f"image={true_labels[col_idx]}",
+            fontsize=7, fontweight='bold', pad=4
+        )
+        ax_orig.axis('off')
+
+        # Bottom row: LIME overlay
+        ax_lime = axes[1, col_idx]
+        ax_lime.imshow(lime_images[col_idx])
+
+        is_correct = true_labels[col_idx] == pred_labels[col_idx]
+        title_color = '#006400' if is_correct else '#8B0000'
+        ax_lime.set_title(
+            f"pred={pred_labels[col_idx]} ({confidences[col_idx]*100:.1f}%)",
+            fontsize=7, fontweight='bold', pad=4, color=title_color
+        )
+        ax_lime.axis('off')
+
+    fig.suptitle(
+        'LIME Explanations for Representative Test Images',
+        fontsize=11, fontweight='bold', y=0.98
+    )
+
+    finalize_plot("lime_grid_paper.png")
+    print("Paper-quality LIME grid figure saved.")
+
+    # --- Also save individual high-res pairs for flexible paper layout ---
+    print("Saving individual high-res LIME pairs...")
+    for i in range(n_images):
+        fig_ind, (ax1, ax2) = plt.subplots(1, 2, figsize=(6, 3))
+
+        ax1.imshow(original_images[i])
+        ax1.set_title(f"Original\n{true_labels[i]}", fontsize=9, fontweight='bold')
+        ax1.axis('off')
+
+        ax2.imshow(lime_images[i])
+        is_correct = true_labels[i] == pred_labels[i]
+        title_color = '#006400' if is_correct else '#8B0000'
+        ax2.set_title(
+            f"LIME\n{pred_labels[i]} ({confidences[i]*100:.1f}%)",
+            fontsize=9, fontweight='bold', color=title_color
+        )
+        ax2.axis('off')
+
+        fig_ind.tight_layout()
+        finalize_plot(f"lime_pair_{true_labels[i]}_{i+1}.png")
+
+    print(f"Saved {n_images} individual LIME pair figures.")
+
+
+print("\n" + "="*50)
+print("PAPER-QUALITY LIME GRID GENERATION")
+print("="*50)
+
+if RUN_EXPLAINABILITY:
+    print(f"Images per class: {GRADCAM_PER_CLASS}")
+    generate_paper_lime_grid(
+        model=model,
+        test_df=test_df,
+        pred_classes=pred_class,
+        pred_probs=pred,
+        class_names=class_names,
+        n_per_class=GRADCAM_PER_CLASS,
+    )
+else:
+    print("LIME grid skipped. Set RUN_EXPLAINABILITY=1 to enable.")
+
+# ==========================================
 # 6.11 K-FOLD STRATIFIED CROSS-VALIDATION (RESEARCH-LEVEL VALIDATION)
 # ==========================================
 if RUN_KFOLD_CV:
@@ -1045,165 +1537,8 @@ if RUN_KFOLD_CV:
     print(f"Final CV Kappa:      {cv_results_df['kappa'].mean():.4f} ± {cv_results_df['kappa'].std():.4f}")
     print(f"Final CV ROC-AUC:    {cv_results_df['roc_auc_macro'].mean():.4f} ± {cv_results_df['roc_auc_macro'].std():.4f}")
 
-    # Reload the main model after CV, since clear_session() in the CV loop
-    # invalidates the previously trained model object needed for explainability
-    if RUN_EXPLAINABILITY and FINAL_MODEL_PATH.exists():
-        print("\nReloading main model for explainability analysis...")
-        tf.keras.backend.clear_session()
-        model = tf.keras.models.load_model(
-            FINAL_MODEL_PATH,
-            custom_objects={
-                "Patches": Patches,
-                "PatchEncoder": PatchEncoder,
-                "SEBlock": SEBlock,
-            },
-            compile=False,
-        )
-        model.compile(optimizer=Adam(learning_rate=1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
-        try:
-            base_model = model.get_layer("efficientnetb4")
-        except ValueError:
-            base_model = None
-            print("Warning: EfficientNet backbone layer not found by name in reloaded model.")
 else:
     print("\nK-Fold cross-validation skipped. Set RUN_KFOLD_CV=1 to enable.")
-
-# ==========================================
-# 7. EXPLAINABLE AI (LIME & GRAD-CAM) FOR HYBRID MODEL
-# ==========================================
-
-# --- GRAD-CAM FOR EFFICIENTNET BRANCH ---
-def make_gradcam_heatmap_hybrid(img_array, hybrid_model, last_conv_layer_name, pred_index=None):
-    """Grad-CAM for the EfficientNetB4 branch of the hybrid model."""
-    grad_model = tf.keras.models.Model(
-        inputs=hybrid_model.inputs,
-        outputs=[hybrid_model.get_layer(last_conv_layer_name).output, hybrid_model.output]
-    )
-    
-    with tf.GradientTape() as tape:
-        last_conv_layer_output, preds = grad_model(img_array, training=False)
-        if pred_index is None:
-            pred_index = tf.argmax(preds[0])
-        class_channel = preds[:, pred_index]
-    
-    grads = tape.gradient(class_channel, last_conv_layer_output)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    last_conv_layer_output = last_conv_layer_output[0]
-    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-    return heatmap.numpy()
-
-
-def display_gradcam_hybrid(img_array, heatmap, true_label, pred_label, confidence, alpha=0.5, save_path=None):
-    """Display Grad-CAM result with original image and heatmap overlay."""
-    img = np.uint8(img_array[0])
-    
-    heatmap_resized = tf.image.resize(heatmap[np.newaxis, :, :, np.newaxis], (IMG_SIZE, IMG_SIZE))
-    heatmap_resized = heatmap_resized[0, :, :, 0].numpy()
-    
-    heatmap_colored = np.uint8(255 * heatmap_resized)
-    jet = plt.colormaps.get_cmap("jet")
-    jet_colors = jet(np.arange(256))[:, :3]
-    jet_heatmap = jet_colors[heatmap_colored]
-    
-    superimposed_img = np.uint8(alpha * (jet_heatmap * 255) + (1 - alpha) * img)
-    
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.imshow(img)
-    plt.title(f"Original Image\nTrue: {true_label}", fontweight='bold')
-    plt.axis('off')
-    
-    plt.subplot(1, 2, 2)
-    plt.imshow(superimposed_img)
-    plt.title(f"Grad-CAM (EfficientNet Branch)\nPred: {pred_label} ({confidence*100:.1f}%)", fontweight='bold')
-    plt.axis('off')
-    
-    plt.tight_layout()
-    finalize_plot(save_path)
-
-
-# --- LIME FOR HYBRID MODEL ---
-def predict_fn_for_lime(images):
-    """Wrapper for LIME to predict on the hybrid model."""
-    images = preprocess_input(images.copy())
-    if images.ndim == 3:
-        images = np.expand_dims(images, axis=0)
-    return model.predict(images, verbose=0)
-
-
-print("\n" + "="*50)
-print("EXPLAINABILITY ANALYSIS: LIME & GRAD-CAM")
-print("="*50)
-
-if RUN_EXPLAINABILITY:
-    # Run LIME and Grad-CAM on 3 random test images
-    for i in range(3):
-        random_idx = random.randint(0, len(test_df) - 1)
-        sample_img_path = test_df['filepath'].iloc[random_idx]
-        true_label = test_df['label'].iloc[random_idx]
-        
-        img = tf.keras.utils.load_img(sample_img_path, target_size=(IMG_SIZE, IMG_SIZE))
-        img_array = tf.keras.utils.img_to_array(img)
-        img_array_expanded = np.expand_dims(img_array, axis=0)
-        
-        preds = model.predict(preprocess_input(img_array_expanded.copy()), verbose=0)
-        pred_idx = np.argmax(preds[0])
-        pred_label = class_names[pred_idx]
-        confidence = np.max(preds[0])
-        
-        print(f"\n--- Image {i+1}: {true_label} (Pred: {pred_label}, {confidence*100:.1f}%) ---")
-        
-        # Grad-CAM on EfficientNetB4 branch - Auto-detect last Conv2D layer
-        print("Computing Grad-CAM on EfficientNetB4 branch...")
-        last_conv_layer = None
-        if base_model is not None:
-            for layer in reversed(base_model.layers):
-                if isinstance(layer, tf.keras.layers.Conv2D):
-                    last_conv_layer = layer.name
-                    break
-        else:
-            for layer in reversed(model.layers):
-                if isinstance(layer, tf.keras.layers.Conv2D):
-                    last_conv_layer = layer.name
-                    break
-        if last_conv_layer is None:
-            print("Warning: Could not find Conv2D layer for Grad-CAM")
-        else:
-            heatmap = make_gradcam_heatmap_hybrid(preprocess_input(img_array_expanded.copy()), model, last_conv_layer)
-            display_gradcam_hybrid(img_array_expanded, heatmap, true_label, pred_label, confidence, save_path=f"gradcam_image_{i+1}.png")
-        
-        # LIME on full hybrid model
-        print("Computing LIME explanation (this may take a moment)...")
-        explainer = lime_image.LimeImageExplainer()
-        explanation = explainer.explain_instance(
-            (img_array / 255.0).astype(np.float32),  # LIME expects 0-1 range
-            predict_fn_for_lime,
-            top_labels=3,
-            hide_color=0,
-            num_samples=300
-        )
-        temp, mask = explanation.get_image_and_mask(
-            explanation.top_labels[0],
-            positive_only=True,
-            num_features=10,
-            hide_rest=False
-        )
-        
-        plt.figure(figsize=(10, 6))
-        plt.imshow(mark_boundaries(temp, mask))
-        plt.title(f"LIME Explanation (Full Hybrid Model)\nTrue: {true_label} | Pred: {pred_label}", fontweight='bold')
-        plt.axis('off')
-        plt.tight_layout()
-        finalize_plot(f"lime_explanation_{i+1}.png")
-
-    print("\n" + "="*50)
-    print("Explanation analysis complete!")
-    print("="*50)
-else:
-    print("Explainability stage skipped. Set RUN_EXPLAINABILITY=1 to enable it.")
 
 if EXPORTED_FIGURES:
     print("\n" + "="*50)
@@ -1211,5 +1546,3 @@ if EXPORTED_FIGURES:
     print("="*50)
     for fig_path in sorted(set(EXPORTED_FIGURES)):
         print(fig_path.resolve())
-
- 
