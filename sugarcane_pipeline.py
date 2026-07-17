@@ -1227,8 +1227,12 @@ if RUN_KFOLD_CV:
     all_fold_pred = []
     all_fold_pred_proba = []
 
+    SAVED_MODELS_DIR = Path("saved_models")
+    SAVED_MODELS_DIR.mkdir(exist_ok=True)
+    
     print(f"\nStarting {K_FOLDS}-fold stratified cross-validation...")
     print(f"Each fold: {CV_EPOCHS_INITIAL} initial epochs + {CV_EPOCHS_FINETUNE} fine-tune epochs")
+    print("Per-fold resume enabled: each fold is loaded independently if its model exists.\n")
 
     for fold_idx, (train_idx, val_idx) in enumerate(skf.split(cv_df['filepath'], cv_df['label'])):
         print(f"\n{'='*50}")
@@ -1237,8 +1241,6 @@ if RUN_KFOLD_CV:
 
         fold_train_df = cv_df.iloc[train_idx].reset_index(drop=True)
         fold_val_df = cv_df.iloc[val_idx].reset_index(drop=True)
-
-        print(f"Train: {len(fold_train_df)} | Val: {len(fold_val_df)}")
 
         # Create data generators for this fold
         fold_train_generator = train_datagen.flow_from_dataframe(
@@ -1252,55 +1254,87 @@ if RUN_KFOLD_CV:
             class_mode='categorical', shuffle=False
         )
 
-        # Compute class weights for this fold's training data
-        fold_class_weights = compute_class_weight(
-            class_weight='balanced',
-            classes=np.unique(fold_train_generator.classes),
-            y=fold_train_generator.classes
-        )
-        fold_weight_dict = dict(enumerate(fold_class_weights))
+        fold_model_path = SAVED_MODELS_DIR / f"fold_{fold_idx + 1}_best.keras"
 
-        # Clear session and build fresh model for this fold
-        tf.keras.backend.clear_session()
-        fold_model, fold_base_model = build_hybrid_model(
-            dense_units=cv_best_params["dense_units"],
-            dropout_rate=cv_best_params["dropout_rate"],
-            learning_rate=cv_best_params["learning_rate"],
-            optimizer_name=cv_best_params["optimizer"],
-            num_classes=len(class_names),
-        )
+        # ── Per-fold resume: load if saved model exists, otherwise train ──
+        fold_trained_this_run = False
 
-        # Callbacks for this fold
-        fold_callbacks = [
-            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3),
-        ]
+        if fold_model_path.exists():
+            # ── LOAD path ──────────────────────────────────────────────────
+            print(f"Fold {fold_idx + 1}: Saved model found at '{fold_model_path}'. Loading and skipping training.")
+            tf.keras.backend.clear_session()
+            fold_model = tf.keras.models.load_model(
+                fold_model_path,
+                custom_objects={
+                    "Patches": Patches,
+                    "PatchEncoder": PatchEncoder,
+                    "SEBlock": SEBlock,
+                },
+                compile=False
+            )
+            fold_model.compile(
+                optimizer='adam',
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
+        else:
+            # ── TRAIN path ─────────────────────────────────────────────────
+            print(f"Fold {fold_idx + 1}: No saved model found. Training from scratch...")
 
-        # Train initial phase (frozen backbone)
-        print(f"Fold {fold_idx + 1}: Training initial phase ({CV_EPOCHS_INITIAL} epochs)...")
-        fold_history = fold_model.fit(
-            fold_train_generator, validation_data=fold_val_generator,
-            epochs=CV_EPOCHS_INITIAL, class_weight=fold_weight_dict,
-            callbacks=fold_callbacks, verbose=1
-        )
+            # Compute class weights for this fold's training data
+            fold_class_weights = compute_class_weight(
+                class_weight='balanced',
+                classes=np.unique(fold_train_generator.classes),
+                y=fold_train_generator.classes
+            )
+            fold_weight_dict = dict(enumerate(fold_class_weights))
 
-        # Fine-tuning phase (unfreeze top layers)
-        print(f"Fold {fold_idx + 1}: Fine-tuning ({CV_EPOCHS_FINETUNE} epochs)...")
-        for layer in fold_base_model.layers[-50:]:
-            if not isinstance(layer, tf.keras.layers.BatchNormalization):
-                layer.trainable = True
+            # Clear session and build fresh model for this fold
+            tf.keras.backend.clear_session()
+            fold_model, fold_base_model = build_hybrid_model(
+                dense_units=cv_best_params["dense_units"],
+                dropout_rate=cv_best_params["dropout_rate"],
+                learning_rate=cv_best_params["learning_rate"],
+                optimizer_name=cv_best_params["optimizer"],
+                num_classes=len(class_names),
+            )
 
-        fold_model.compile(
-            optimizer=Adam(learning_rate=1e-5),
-            loss='categorical_crossentropy', metrics=['accuracy']
-        )
-        fold_history_finetune = fold_model.fit(
-            fold_train_generator, validation_data=fold_val_generator,
-            epochs=CV_EPOCHS_FINETUNE, class_weight=fold_weight_dict,
-            callbacks=fold_callbacks, verbose=1
-        )
+            # Callbacks for this fold
+            fold_callbacks = [
+                EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+                ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3),
+                tf.keras.callbacks.ModelCheckpoint(
+                    filepath=str(fold_model_path), monitor='val_loss', 
+                    save_best_only=True, verbose=1
+                )
+            ]
 
-        # Evaluate on validation fold
+            # Train initial phase (frozen backbone)
+            print(f"Fold {fold_idx + 1}: Training initial phase ({CV_EPOCHS_INITIAL} epochs)...")
+            fold_history = fold_model.fit(
+                fold_train_generator, validation_data=fold_val_generator,
+                epochs=CV_EPOCHS_INITIAL, class_weight=fold_weight_dict,
+                callbacks=fold_callbacks, verbose=1
+            )
+
+            # Fine-tuning phase (unfreeze top layers)
+            print(f"Fold {fold_idx + 1}: Fine-tuning ({CV_EPOCHS_FINETUNE} epochs)...")
+            for layer in fold_base_model.layers[-50:]:
+                if not isinstance(layer, tf.keras.layers.BatchNormalization):
+                    layer.trainable = True
+
+            fold_model.compile(
+                optimizer=Adam(learning_rate=1e-5),
+                loss='categorical_crossentropy', metrics=['accuracy']
+            )
+            fold_history_finetune = fold_model.fit(
+                fold_train_generator, validation_data=fold_val_generator,
+                epochs=CV_EPOCHS_FINETUNE, class_weight=fold_weight_dict,
+                callbacks=fold_callbacks, verbose=1
+            )
+            fold_trained_this_run = True
+
+        # ── Evaluate on validation fold (always runs) ──────────────────────
         fold_val_generator.reset()
         fold_pred = fold_model.predict(fold_val_generator, verbose=0)
         fold_pred_class = np.argmax(fold_pred, axis=1)
@@ -1342,11 +1376,12 @@ if RUN_KFOLD_CV:
         all_fold_pred.extend(fold_pred_class)
         all_fold_pred_proba.append(fold_pred)
 
-        # Store histories for plotting
-        fold_histories.append({
-            'initial': fold_history.history,
-            'finetune': fold_history_finetune.history,
-        })
+        # Store training histories only for folds that were trained this run
+        if fold_trained_this_run:
+            fold_histories.append({
+                'initial': fold_history.history,
+                'finetune': fold_history_finetune.history,
+            })
 
         print(f"\nFold {fold_idx + 1} Results:")
         print(f"  Accuracy: {fold_acc:.4f}")
@@ -1356,7 +1391,9 @@ if RUN_KFOLD_CV:
         print(f"  ROC-AUC (Macro): {fold_roc_auc:.4f}")
 
         # Clean up to free GPU memory before next fold
-        del fold_model, fold_base_model
+        del fold_model
+        if fold_trained_this_run:
+            del fold_base_model
         tf.keras.backend.clear_session()
 
     # ==========================================
