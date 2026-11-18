@@ -137,6 +137,11 @@ val_df, test_df = train_test_split(temp_df, test_size=0.50, stratify=temp_df["la
 
 print(f"Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
 
+# new code
+train_df.to_csv("split_train.csv", index=False)
+val_df.to_csv("split_val.csv", index=False)
+test_df.to_csv("split_test.csv", index=False)
+
 # ==========================================
 # 1.5 DATA LEAKAGE CHECK (MD5 HASH)
 # ==========================================
@@ -404,8 +409,8 @@ else:
 
     print("\nStarting Optuna Study...")
     study = optuna.create_study(
-        study_name="sugarcane_efficientnet_study",
-        storage="sqlite:///sugarcane_optuna_study.db",  # Saves locally in your VS Code folder
+        study_name="hybrid_clean_study",
+        storage="sqlite:///hybrid_clean.db",  # Saves locally in your VS Code folder
         load_if_exists=True,
         direction="maximize",
         pruner=optuna.pruners.MedianPruner()
@@ -492,6 +497,10 @@ test_loss, test_acc = model.evaluate(test_generator)
 print(f"\nFinal Test Accuracy: {test_acc:.4f}")
 
 pred = model.predict(test_generator)
+
+#new code
+np.save("hybrid_test_probs.npy", pred)
+
 pred_class = np.argmax(pred, axis=1)
 true_class = test_generator.classes
 
@@ -515,6 +524,9 @@ finalize_plot("confusion_matrix.png")
 # ROC-AUC Curve
 y_test_binarized = label_binarize(true_class, classes=np.arange(len(class_names)))
 n_classes = y_test_binarized.shape[1]
+
+# Compute macro-averaged ROC-AUC (OvR) for summary reporting
+roc_auc_macro = roc_auc_score(y_test_binarized, pred, multi_class='ovr', average='macro')
 
 plt.figure(figsize=(8, 6))
 for i in range(n_classes):
@@ -624,6 +636,7 @@ print(f"F1-Score (Macro): {report_dict['macro avg']['f1-score']:.4f}")
 print(f"F1-Score (Weighted): {report_dict['weighted avg']['f1-score']:.4f}")
 print(f"MCC: {mcc:.4f}")
 print(f"Kappa: {kappa:.4f}")
+print(f"ROC-AUC (Macro OvR): {roc_auc_macro:.4f}")
 
 # ==========================================
 # 6.8 PRECISION-RECALL CURVES
@@ -1196,8 +1209,8 @@ if RUN_KFOLD_CV:
     # Load best hyperparameters from Optuna study
     try:
         cv_study = optuna.load_study(
-            study_name="sugarcane_efficientnet_study",
-            storage="sqlite:///sugarcane_optuna_study.db"
+            study_name="hybrid_clean_study",
+            storage="sqlite:///hybrid_clean.db"
         )
         cv_best_params = cv_study.best_params
         print(f"Loaded best hyperparameters from Optuna study: {cv_best_params}")
@@ -1583,3 +1596,17 @@ if EXPORTED_FIGURES:
     print("="*50)
     for fig_path in sorted(set(EXPORTED_FIGURES)):
         print(fig_path.resolve())
+
+import optuna
+
+print("Total after dedup:", len(df))
+print("Train:", len(train_df), "Val:", len(val_df), "Test:", len(test_df))
+print(test_df["label"].value_counts())
+
+study = optuna.load_study(
+    study_name="hybrid_clean_study",
+    storage="sqlite:///hybrid_clean.db"
+)
+print("Number of Optuna trials:", len(study.trials))
+print("Best value:", study.best_value)
+print("Best params:", study.best_params)
